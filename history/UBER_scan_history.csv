@@ -1,2 +1,3 @@
-date,ticker,spot,atm_iv,technical_score
-2026-07-23 00:47:11.472273,UBER,70.33000183105469,0.45752495605468757,18.0
+date,ticker,spot,atm_iv,technical_score,ema9_signal,vwap_signal,sma50_signal,macd_signal,macd_momentum_signal,rsi_signal,rel_volume_signal,bb_signal
+2026-07-23 00:47:11.472273,UBER,70.33000183105469,0.4575249560546875,18.0,,,,,,,,
+2026-07-23 01:14:49.841534,UBER,70.33000183105469,0.4575249560546875,18.0,1.0,-1.0,-1.0,1.0,1.0,0.0,1.0,0.0
