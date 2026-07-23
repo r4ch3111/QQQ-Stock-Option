@@ -225,26 +225,37 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def technical_score(latest: pd.Series, previous: pd.Series) -> dict[str, float | str]:
-    """Transparent directional score from -100 (bearish) to +100 (bullish)."""
+def technical_score(latest: pd.Series, previous: pd.Series) -> dict[str, object]:
+    """Transparent directional score from -100 (bearish) to +100 (bullish).
+
+    Also returns a `signals` dict of each individual indicator's signed
+    contribution (+1 bullish, -1 bearish, 0 no signal that day). These are
+    logged per-scan so each indicator's real-world hit rate can be checked
+    independently later, rather than only the blended composite score.
+    """
     points = 0.0
     reasons: list[str] = []
+    signals: dict[str, float] = {}
     close = float(latest["Close"])
 
     comparisons = [
-        ("EMA_9", 18, "above 9 EMA", "below 9 EMA"),
-        ("VWAP", 18, "above VWAP", "below VWAP"),
-        ("SMA_50", 12, "above 50 SMA", "below 50 SMA"),
+        ("EMA_9", 18, "ema9_signal", "above 9 EMA", "below 9 EMA"),
+        ("VWAP", 18, "vwap_signal", "above VWAP", "below VWAP"),
+        ("SMA_50", 12, "sma50_signal", "above 50 SMA", "below 50 SMA"),
     ]
-    for column, weight, bull_text, bear_text in comparisons:
+    for column, weight, signal_key, bull_text, bear_text in comparisons:
         value = latest.get(column)
         if pd.notna(value):
             if close > float(value):
                 points += weight
                 reasons.append(bull_text)
+                signals[signal_key] = 1.0
             else:
                 points -= weight
                 reasons.append(bear_text)
+                signals[signal_key] = -1.0
+        else:
+            signals[signal_key] = 0.0
 
     macd = latest.get("MACD")
     signal = latest.get("MACD_SIGNAL")
@@ -254,51 +265,75 @@ def technical_score(latest: pd.Series, previous: pd.Series) -> dict[str, float |
         if float(macd) > float(signal):
             points += 16
             reasons.append("MACD bullish")
+            signals["macd_signal"] = 1.0
         else:
             points -= 16
             reasons.append("MACD bearish")
+            signals["macd_signal"] = -1.0
+    else:
+        signals["macd_signal"] = 0.0
+
     if pd.notna(hist) and pd.notna(prev_hist):
         if float(hist) > float(prev_hist):
             points += 6
             reasons.append("MACD momentum improving")
+            signals["macd_momentum_signal"] = 1.0
         else:
             points -= 6
             reasons.append("MACD momentum weakening")
+            signals["macd_momentum_signal"] = -1.0
+    else:
+        signals["macd_momentum_signal"] = 0.0
 
     rsi = latest.get("RSI_14")
+    signals["rsi_signal"] = 0.0
     if pd.notna(rsi):
         rsi = float(rsi)
         if 55 <= rsi <= 70:
             points += 12
             reasons.append("RSI supports bullish momentum")
+            signals["rsi_signal"] = 1.0
         elif 30 <= rsi <= 45:
             points -= 12
             reasons.append("RSI supports bearish momentum")
+            signals["rsi_signal"] = -1.0
         elif rsi > 75:
             points -= 4
             reasons.append("RSI potentially overbought")
+            signals["rsi_signal"] = -1.0
         elif rsi < 25:
             points += 4
             reasons.append("RSI potentially oversold")
+            signals["rsi_signal"] = 1.0
 
     rel_volume = latest.get("REL_VOLUME")
     candle_direction = np.sign(float(latest["Close"]) - float(latest["Open"]))
+    signals["rel_volume_signal"] = 0.0
     if pd.notna(rel_volume) and float(rel_volume) >= 1.25:
         points += 8 * candle_direction
         reasons.append("high relative volume confirms latest candle")
+        signals["rel_volume_signal"] = float(candle_direction)
 
     upper = latest.get("BB_UPPER")
     lower = latest.get("BB_LOWER")
+    signals["bb_signal"] = 0.0
     if pd.notna(upper) and close > float(upper):
         points += 5
         reasons.append("above upper Bollinger Band")
+        signals["bb_signal"] = 1.0
     elif pd.notna(lower) and close < float(lower):
         points -= 5
         reasons.append("below lower Bollinger Band")
+        signals["bb_signal"] = -1.0
 
     score = float(np.clip(points, -100, 100))
     direction = "bullish" if score >= 20 else "bearish" if score <= -20 else "neutral"
-    return {"score": score, "direction": direction, "reasons": "; ".join(reasons)}
+    return {
+        "score": score,
+        "direction": direction,
+        "reasons": "; ".join(reasons),
+        "signals": signals,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -651,20 +686,30 @@ def append_history_log(
     spot: float,
     atm_iv: float | None,
     technical_score: float,
+    signals: dict[str, float] | None = None,
 ) -> pd.DataFrame:
+    """Append one scan's data to the running log, including per-indicator signals.
+
+    Storing each indicator's signed signal (not just the blended composite
+    score) is what lets evaluate_indicator_history later check each one's
+    real-world hit rate independently.
+    """
     history_dir.mkdir(parents=True, exist_ok=True)
     path = history_dir / f"{ticker}_scan_history.csv"
     existing = load_history_log(history_dir, ticker)
-    new_row = pd.DataFrame(
-        [{
-            "date": pd.Timestamp.now(tz="UTC").tz_localize(None),
-            "ticker": ticker,
-            "spot": spot,
-            "atm_iv": atm_iv,
-            "technical_score": technical_score,
-        }]
-    )
-    combined = pd.concat([existing, new_row], ignore_index=True)
+    row: dict[str, object] = {
+        "date": pd.Timestamp.now(tz="UTC").tz_localize(None),
+        "ticker": ticker,
+        "spot": spot,
+        "atm_iv": atm_iv,
+        "technical_score": technical_score,
+    }
+    if signals:
+        row.update(signals)
+    new_row = pd.DataFrame([row])
+    # Outer-join columns so older logs without indicator columns (or newly
+    # added indicators) don't break — missing values just become NaN.
+    combined = pd.concat([existing, new_row], ignore_index=True, sort=False)
     combined.to_csv(path, index=False)
     return combined
 
@@ -735,9 +780,94 @@ def evaluate_score_history(
     return results
 
 
+def evaluate_indicator_history(
+    history: pd.DataFrame,
+    daily_prices: pd.DataFrame,
+    indicator_columns: list[str],
+    forward_days: tuple[int, ...] = (1, 3, 5),
+    min_samples: int = 10,
+) -> dict[str, dict[int, dict[str, float]]]:
+    """Backtest each individual indicator's signal against actual forward returns.
+
+    This is the per-indicator version of evaluate_score_history: instead of
+    only checking the blended composite score, it checks each indicator
+    (EMA position, MACD cross, RSI zone, etc.) independently, so you can see
+    which ones have actually carried predictive weight in your own logged
+    history rather than assuming the hand-picked weights in technical_score
+    are correct. Days where an indicator gave no signal (0) are excluded
+    rather than counted as neutral, since a 0 has no directional claim to test.
+    """
+    results: dict[str, dict[int, dict[str, float]]] = {}
+    if history.empty:
+        return results
+
+    close = daily_prices["Close"].copy()
+    close.index = pd.to_datetime(close.index).tz_localize(None)
+
+    for column in indicator_columns:
+        if column not in history.columns:
+            continue
+        horizon_results: dict[int, dict[str, float]] = {}
+        for horizon in forward_days:
+            pairs: list[tuple[float, float]] = []
+            for _, row in history.iterrows():
+                raw_signal = row.get(column)
+                if pd.isna(raw_signal) or float(raw_signal) == 0.0:
+                    continue
+                entry_date = pd.Timestamp(row["date"]).tz_localize(None)
+                prior = close[close.index <= entry_date]
+                future = close[close.index > entry_date]
+                if prior.empty or len(future) < horizon:
+                    continue
+                entry_price = float(prior.iloc[-1])
+                future_price = float(future.iloc[horizon - 1])
+                forward_return = future_price / entry_price - 1.0
+                pairs.append((float(raw_signal), forward_return))
+
+            if len(pairs) < min_samples:
+                continue
+            signal_vals, returns_vals = zip(*pairs)
+            signal_arr = np.array(signal_vals)
+            returns_arr = np.array(returns_vals)
+            correlation = (
+                float(np.corrcoef(signal_arr, returns_arr)[0, 1])
+                if np.std(signal_arr) > 0 else 0.0
+            )
+            hit_rate = float(np.mean((signal_arr > 0) == (returns_arr > 0)))
+            horizon_results[horizon] = {
+                "n": len(pairs),
+                "correlation": correlation,
+                "hit_rate": hit_rate,
+            }
+        if horizon_results:
+            results[column] = horizon_results
+
+    return results
+
+
+def rank_indicators(
+    indicator_results: dict[str, dict[int, dict[str, float]]],
+    horizon: int,
+) -> list[tuple[str, dict[str, float]]]:
+    """Rank indicators by hit rate at a given horizon, ties broken by |correlation|.
+
+    This ranks what your OWN logged history shows so far — with a small
+    sample, a top rank can easily be noise rather than a durable edge. Treat
+    it as a hypothesis to keep watching, not a conclusion to trade on.
+    """
+    ranked = [
+        (name, horizons[horizon])
+        for name, horizons in indicator_results.items()
+        if horizon in horizons
+    ]
+    ranked.sort(key=lambda item: (item[1]["hit_rate"], abs(item[1]["correlation"])), reverse=True)
+    return ranked
+
+
 # ---------------------------------------------------------------------------
 # Telegram notifications
 # ---------------------------------------------------------------------------
+
 
 def send_telegram_message(token: str, chat_id: str, text: str) -> None:
     """Send a text message via a Telegram bot.
@@ -781,6 +911,8 @@ def format_top_contracts_for_telegram(
     iv_rank_info: dict[str, float] | None = None,
     skew_info: dict[str, float] | None = None,
     score_accuracy: dict[int, dict[str, float]] | None = None,
+    indicator_ranking: list[tuple[str, dict[str, float]]] | None = None,
+    indicator_horizon: int = 3,
     top_n: int = 5,
 ) -> str:
     lines = [
@@ -803,6 +935,10 @@ def format_top_contracts_for_telegram(
             for h, v in sorted(score_accuracy.items())
         ]
         lines.append("Score accuracy: " + ", ".join(parts))
+    if indicator_ranking:
+        lines.append(f"Top indicators ({indicator_horizon}d hit-rate):")
+        for name, stats in indicator_ranking[:3]:
+            lines.append(f"  {name}: {stats['hit_rate']:.0%} (n={stats['n']})")
 
     lines.append("")
     for row in options.head(top_n).itertuples():
@@ -874,6 +1010,7 @@ def print_summary(
     iv_rank_info: dict[str, float] | None = None,
     skew_info: dict[str, float] | None = None,
     score_accuracy: dict[int, dict[str, float]] | None = None,
+    indicator_accuracy: dict[str, dict[int, dict[str, float]]] | None = None,
 ) -> None:
     latest = intraday.iloc[-1]
     spot = float(latest["Close"])
@@ -916,6 +1053,26 @@ def print_summary(
             )
     else:
         print("Technical score backtest: not enough logged history yet (needs 10+ scans)")
+
+    if indicator_accuracy:
+        print("\nPer-indicator backtest (which signals have actually been predictive):")
+        horizons_seen = sorted({h for v in indicator_accuracy.values() for h in v})
+        for horizon in horizons_seen:
+            ranked = rank_indicators(indicator_accuracy, horizon)
+            if not ranked:
+                continue
+            print(f"  {horizon}-day horizon, ranked by hit-rate:")
+            for name, stats in ranked:
+                print(
+                    f"    {name:<24} hit-rate {stats['hit_rate']:.0%}  "
+                    f"correlation {stats['correlation']:+.2f}  n={stats['n']}"
+                )
+        print(
+            "  Caution: small samples produce noisy rankings — treat a top indicator "
+            "as a hypothesis to keep watching, not a conclusion."
+        )
+    else:
+        print("Per-indicator backtest: not enough logged history yet (needs 10+ signals per indicator)")
 
     print("\nTop contracts by transparent heuristic score:")
     columns = [
@@ -1012,9 +1169,15 @@ def main() -> int:
         # script's own accumulated history rather than a paid data source.
         atm_iv = get_atm_iv(options, spot)
         skew_info = compute_skew(options, spot, config.skew_target_pct)
-        history = append_history_log(config.history_dir, config.ticker, spot, atm_iv, technical["score"])
+        history = append_history_log(
+            config.history_dir, config.ticker, spot, atm_iv, technical["score"],
+            signals=technical.get("signals"),
+        )
         iv_rank_info = compute_iv_rank(history, atm_iv)
         score_accuracy = evaluate_score_history(history, daily)
+        indicator_signal_columns = list(technical.get("signals", {}).keys())
+        indicator_accuracy = evaluate_indicator_history(history, daily, indicator_signal_columns)
+        top_indicators = rank_indicators(indicator_accuracy, horizon=3) if indicator_accuracy else None
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         daily.to_csv(config.output_dir / f"{config.ticker}_daily_{timestamp}.csv")
@@ -1033,6 +1196,7 @@ def main() -> int:
         print_summary(
             config, daily, intraday, technical, expiration, options,
             iv_rank_info=iv_rank_info, skew_info=skew_info, score_accuracy=score_accuracy,
+            indicator_accuracy=indicator_accuracy,
         )
         print(f"\nFiles saved in: {config.output_dir.resolve()}")
 
@@ -1040,6 +1204,7 @@ def main() -> int:
             message = format_top_contracts_for_telegram(
                 options, technical, spot, config.ticker,
                 iv_rank_info=iv_rank_info, skew_info=skew_info, score_accuracy=score_accuracy,
+                indicator_ranking=top_indicators, indicator_horizon=3,
                 top_n=args.telegram_top_n,
             )
             send_telegram_message(telegram_token, telegram_chat_id, message)
