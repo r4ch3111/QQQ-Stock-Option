@@ -1,1 +1,44 @@
 name: QQQ Options Scan
+
+on:
+  workflow_dispatch:   # manual trigger only, no schedule
+    inputs:
+      ticker:
+        description: "Ticker to scan"
+        required: false
+        default: "QQQ"
+
+permissions:
+  contents: write   # needed so the workflow can commit the growing history log back to the repo
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install yfinance pandas numpy scipy matplotlib requests
+
+      - name: Run scan
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python qqq_options_model.py --ticker ${{ github.event.inputs.ticker }} --telegram-send-chart
+
+      # The history/ folder accumulates ATM IV and technical score on every
+      # run, which is what makes IV rank and the score backtest meaningful
+      # over time. Without committing it back, GitHub Actions would discard
+      # it at the end of every run and IV rank would never build up history.
+      - name: Commit updated history log
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add history/
+          git diff --cached --quiet || git commit -m "Update scan history log [skip ci]"
+          git push

@@ -60,6 +60,8 @@ class Config:
     intraday_interval: str = "5m"
     daily_period: str = "1y"
     output_dir: Path = Path("qqq_model_output")
+    history_dir: Path = Path("history")
+    skew_target_pct: float = 0.08  # ~8% OTM strikes used for the skew comparison
 
 
 @dataclass(frozen=True)
@@ -507,6 +509,11 @@ def build_option_table(
         theta_burden = min(abs(bs.theta_per_day) / premium, 1.0)
         affordability = 1.0 if premium * 100 <= config.account_size * config.max_risk_pct else 0.25
 
+        # Breakeven at expiration and max loss, assuming a long option position
+        # held to expiration (the max loss for a buyer is always the premium paid).
+        breakeven_price = strike + premium if option_type == "call" else strike - premium
+        max_loss_dollars = premium * 100
+
         # Transparent heuristic—not a forecast.
         composite = 100 * (
             0.25 * directional_alignment[option_type]
@@ -552,6 +559,9 @@ def build_option_table(
                 "decision_score": composite,
                 "target_100pct_scenario": scenario_return >= config.target_return,
                 "within_risk_budget": premium * 100 <= config.account_size * config.max_risk_pct,
+                "breakeven_price": breakeven_price,
+                "breakeven_move_pct": (breakeven_price / spot - 1.0),
+                "max_loss_dollars": max_loss_dollars,
             }
         )
 
@@ -571,6 +581,158 @@ def build_option_table(
         ascending=[False, False, True],
     ).reset_index(drop=True)
     return result
+
+
+# ---------------------------------------------------------------------------
+# IV rank, skew, and scoring-accuracy history
+#
+# yfinance does not expose historical implied volatility, so a textbook
+# 52-week IV rank isn't available from a cold start. Instead, this script
+# keeps its own running log of ATM IV and technical score on every scan.
+# IV rank and score-accuracy therefore start out based on whatever history
+# exists (labeled honestly as such) and become more meaningful the longer
+# you run scans, since the log accumulates over time.
+# ---------------------------------------------------------------------------
+
+def get_atm_iv(options: pd.DataFrame, spot: float) -> float | None:
+    """Average IV of the call and put contracts closest to the money."""
+    if options.empty:
+        return None
+    nearest_idx = (options["strike"] - spot).abs().sort_values().index
+    nearest = options.loc[nearest_idx[:4]]  # a few closest strikes, both types
+    ivs = nearest["IV"].dropna()
+    return float(ivs.mean()) if not ivs.empty else None
+
+
+def compute_skew(options: pd.DataFrame, spot: float, target_pct: float) -> dict[str, float]:
+    """Compare IV of an OTM put vs. an OTM call roughly equidistant from spot.
+
+    A positive skew (put IV > call IV) is the normal equity/index pattern and
+    reflects richer pricing for downside protection. A flattening or inverted
+    skew can signal shifting sentiment, independent of the technical score.
+    """
+    calls = options[options["option_type"] == "call"]
+    puts = options[options["option_type"] == "put"]
+    if calls.empty or puts.empty:
+        return {}
+
+    target_call_strike = spot * (1 + target_pct)
+    target_put_strike = spot * (1 - target_pct)
+    call_row = calls.iloc[(calls["strike"] - target_call_strike).abs().to_numpy().argsort()[:1]]
+    put_row = puts.iloc[(puts["strike"] - target_put_strike).abs().to_numpy().argsort()[:1]]
+    if call_row.empty or put_row.empty:
+        return {}
+
+    call_iv = float(call_row["IV"].iloc[0])
+    put_iv = float(put_row["IV"].iloc[0])
+    return {
+        "call_strike": float(call_row["strike"].iloc[0]),
+        "put_strike": float(put_row["strike"].iloc[0]),
+        "call_iv": call_iv,
+        "put_iv": put_iv,
+        "skew": put_iv - call_iv,
+    }
+
+
+def load_history_log(history_dir: Path, ticker: str) -> pd.DataFrame:
+    path = history_dir / f"{ticker}_scan_history.csv"
+    columns = ["date", "ticker", "spot", "atm_iv", "technical_score"]
+    if not path.exists():
+        return pd.DataFrame(columns=columns)
+    try:
+        return pd.read_csv(path, parse_dates=["date"])
+    except (pd.errors.EmptyDataError, ValueError):
+        return pd.DataFrame(columns=columns)
+
+
+def append_history_log(
+    history_dir: Path,
+    ticker: str,
+    spot: float,
+    atm_iv: float | None,
+    technical_score: float,
+) -> pd.DataFrame:
+    history_dir.mkdir(parents=True, exist_ok=True)
+    path = history_dir / f"{ticker}_scan_history.csv"
+    existing = load_history_log(history_dir, ticker)
+    new_row = pd.DataFrame(
+        [{
+            "date": pd.Timestamp.now(tz="UTC").tz_localize(None),
+            "ticker": ticker,
+            "spot": spot,
+            "atm_iv": atm_iv,
+            "technical_score": technical_score,
+        }]
+    )
+    combined = pd.concat([existing, new_row], ignore_index=True)
+    combined.to_csv(path, index=False)
+    return combined
+
+
+def compute_iv_rank(history: pd.DataFrame, current_iv: float | None) -> dict[str, float] | None:
+    """Percentile rank of the current ATM IV against the logged history.
+
+    With a short history this is a rank against a small sample, not a true
+    52-week rank — the sample size (n) is always included so that's clear.
+    """
+    if current_iv is None:
+        return None
+    ivs = history["atm_iv"].dropna()
+    if len(ivs) < 3:
+        return None
+    rank = float((ivs <= current_iv).mean() * 100)
+    return {"iv_rank": rank, "n": int(len(ivs)), "iv_min": float(ivs.min()), "iv_max": float(ivs.max())}
+
+
+def evaluate_score_history(
+    history: pd.DataFrame,
+    daily_prices: pd.DataFrame,
+    forward_days: tuple[int, ...] = (1, 3, 5),
+    min_samples: int = 10,
+) -> dict[int, dict[str, float]]:
+    """Backtest the technical score against what QQQ actually did afterward.
+
+    For each past scan, looks forward N trading days in the daily price
+    history and checks: did the sign of the score match the sign of the
+    subsequent return, and how correlated were score and return overall.
+    This does NOT validate the option-pricing math (Black-Scholes is a
+    standard formula) — it validates whether the heuristic technical score
+    has actually been predictive, which is the part worth checking.
+    """
+    results: dict[int, dict[str, float]] = {}
+    if history.empty or len(history) < min_samples:
+        return results
+
+    close = daily_prices["Close"].copy()
+    close.index = pd.to_datetime(close.index).tz_localize(None)
+
+    for horizon in forward_days:
+        pairs: list[tuple[float, float]] = []
+        for _, row in history.iterrows():
+            entry_date = pd.Timestamp(row["date"]).tz_localize(None)
+            prior = close[close.index <= entry_date]
+            future = close[close.index > entry_date]
+            if prior.empty or len(future) < horizon:
+                continue
+            entry_price = float(prior.iloc[-1])
+            future_price = float(future.iloc[horizon - 1])
+            forward_return = future_price / entry_price - 1.0
+            pairs.append((float(row["technical_score"]), forward_return))
+
+        if len(pairs) < min_samples:
+            continue
+        scores, returns = zip(*pairs)
+        scores_arr = np.array(scores)
+        returns_arr = np.array(returns)
+        correlation = float(np.corrcoef(scores_arr, returns_arr)[0, 1]) if np.std(scores_arr) > 0 else 0.0
+        nonzero = scores_arr != 0
+        hit_rate = (
+            float(np.mean((scores_arr[nonzero] > 0) == (returns_arr[nonzero] > 0)))
+            if nonzero.any() else 0.0
+        )
+        results[horizon] = {"n": len(pairs), "correlation": correlation, "hit_rate": hit_rate}
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -616,19 +778,40 @@ def format_top_contracts_for_telegram(
     technical: dict[str, float | str],
     spot: float,
     ticker: str,
+    iv_rank_info: dict[str, float] | None = None,
+    skew_info: dict[str, float] | None = None,
+    score_accuracy: dict[int, dict[str, float]] | None = None,
     top_n: int = 5,
 ) -> str:
     lines = [
         f"*{ticker} Options Scan*",
         f"Spot: ${spot:,.2f} | Technical: {technical['score']:.0f}/100 ({technical['direction']})",
-        "",
     ]
+
+    if iv_rank_info:
+        lines.append(
+            f"ATM IV rank: {iv_rank_info['iv_rank']:.0f}th pct (n={iv_rank_info['n']} scans)"
+        )
+    if skew_info:
+        skew_label = "put-skewed" if skew_info["skew"] > 0 else "call-skewed"
+        lines.append(
+            f"Skew: {skew_info['skew']*100:+.1f} vol pts ({skew_label})"
+        )
+    if score_accuracy:
+        parts = [
+            f"{h}d hit-rate {v['hit_rate']:.0%} (n={v['n']})"
+            for h, v in sorted(score_accuracy.items())
+        ]
+        lines.append("Score accuracy: " + ", ".join(parts))
+
+    lines.append("")
     for row in options.head(top_n).itertuples():
         liquidity_flag = "✅" if row.passes_liquidity_filter else "⚠️"
         lines.append(
             f"{liquidity_flag} {row.option_type.upper()} {row.strike:g}  exp {row.expiration}\n"
             f"   Mid ${row.mid:.2f}  |  Score {row.decision_score:.0f}/100\n"
-            f"   P(ITM) {row.probability_ITM:.0%}  |  DTE {row.DTE:.1f}  |  Θ/day {row.theta_pct_of_premium:.1%} of premium"
+            f"   P(ITM) {row.probability_ITM:.0%}  |  DTE {row.DTE:.1f}  |  Θ/day {row.theta_pct_of_premium:.1%} of premium\n"
+            f"   Breakeven ${row.breakeven_price:.2f} ({row.breakeven_move_pct:+.1%} move)  |  Max loss ${row.max_loss_dollars:.0f}"
         )
     lines.append("")
     lines.append("_Heuristic score, not a trade signal. Not financial advice._")
@@ -688,6 +871,9 @@ def print_summary(
     technical: dict[str, float | str],
     expiration: str,
     options: pd.DataFrame,
+    iv_rank_info: dict[str, float] | None = None,
+    skew_info: dict[str, float] | None = None,
+    score_accuracy: dict[int, dict[str, float]] | None = None,
 ) -> None:
     latest = intraday.iloc[-1]
     spot = float(latest["Close"])
@@ -704,22 +890,52 @@ def print_summary(
     print(f"Technical score:       {technical['score']:.1f}/100 ({technical['direction']})")
     print(f"Technical evidence:    {technical['reasons']}")
     print(f"Selected expiration:   {expiration}")
+
+    if iv_rank_info:
+        print(
+            f"ATM IV rank:           {iv_rank_info['iv_rank']:.0f}th percentile "
+            f"(n={iv_rank_info['n']} logged scans, range {iv_rank_info['iv_min']:.1%}-{iv_rank_info['iv_max']:.1%})"
+        )
+    else:
+        print("ATM IV rank:           not enough logged history yet (needs 3+ scans)")
+
+    if skew_info:
+        skew_label = "put-skewed (normal)" if skew_info["skew"] > 0 else "call-skewed"
+        print(
+            f"Put/call skew:         {skew_info['skew']*100:+.1f} vol pts "
+            f"(put {skew_info['put_strike']:g} IV {skew_info['put_iv']:.1%} vs "
+            f"call {skew_info['call_strike']:g} IV {skew_info['call_iv']:.1%}) — {skew_label}"
+        )
+
+    if score_accuracy:
+        print("Technical score backtest (vs. actual forward QQQ return):")
+        for horizon, stats in sorted(score_accuracy.items()):
+            print(
+                f"  {horizon}-day: hit-rate {stats['hit_rate']:.0%}, "
+                f"correlation {stats['correlation']:+.2f}, n={stats['n']}"
+            )
+    else:
+        print("Technical score backtest: not enough logged history yet (needs 10+ scans)")
+
     print("\nTop contracts by transparent heuristic score:")
     columns = [
         "option_type", "strike", "DTE", "mid", "contract_cost", "IV",
         "probability_ITM", "theta_pct_of_premium",
-        "scenario_return_after_1day", "decision_score",
-        "passes_liquidity_filter", "within_risk_budget",
+        "scenario_return_after_1day", "breakeven_price", "max_loss_dollars",
+        "decision_score", "passes_liquidity_filter", "within_risk_budget",
     ]
     display = options[columns].head(12).copy()
     for col in ["IV", "probability_ITM", "theta_pct_of_premium", "scenario_return_after_1day"]:
         display[col] = display[col].map(lambda x: f"{x:.1%}")
     display["mid"] = display["mid"].map(lambda x: f"${x:.2f}")
     display["contract_cost"] = display["contract_cost"].map(lambda x: f"${x:.0f}")
+    display["breakeven_price"] = display["breakeven_price"].map(lambda x: f"${x:.2f}")
+    display["max_loss_dollars"] = display["max_loss_dollars"].map(lambda x: f"${x:.0f}")
     display["decision_score"] = display["decision_score"].map(lambda x: f"{x:.1f}")
     print(display.to_string(index=False))
     print("\nCAUTION: The score is a rule-based comparison tool, not a buy/sell signal.")
     print("A 100% target generally requires a large, fast move and can also produce a 100% loss.")
+    print("IV rank and score backtest are based on this script's own logged history, not a full market dataset.")
 
 
 # ---------------------------------------------------------------------------
@@ -792,6 +1008,14 @@ def main() -> int:
         expiration = choose_expiration(ticker, args.expiration, args.min_dte, args.max_dte)
         options = build_option_table(config, spot, expiration, technical)
 
+        # IV rank, skew, and score-accuracy backtest, all built from this
+        # script's own accumulated history rather than a paid data source.
+        atm_iv = get_atm_iv(options, spot)
+        skew_info = compute_skew(options, spot, config.skew_target_pct)
+        history = append_history_log(config.history_dir, config.ticker, spot, atm_iv, technical["score"])
+        iv_rank_info = compute_iv_rank(history, atm_iv)
+        score_accuracy = evaluate_score_history(history, daily)
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         daily.to_csv(config.output_dir / f"{config.ticker}_daily_{timestamp}.csv")
         intraday.to_csv(config.output_dir / f"{config.ticker}_intraday_{timestamp}.csv")
@@ -806,12 +1030,17 @@ def main() -> int:
             f"{config.ticker} intraday price and indicators",
         )
         save_score_chart(options, score_chart_path)
-        print_summary(config, daily, intraday, technical, expiration, options)
+        print_summary(
+            config, daily, intraday, technical, expiration, options,
+            iv_rank_info=iv_rank_info, skew_info=skew_info, score_accuracy=score_accuracy,
+        )
         print(f"\nFiles saved in: {config.output_dir.resolve()}")
 
         if telegram_enabled:
             message = format_top_contracts_for_telegram(
-                options, technical, spot, config.ticker, top_n=args.telegram_top_n
+                options, technical, spot, config.ticker,
+                iv_rank_info=iv_rank_info, skew_info=skew_info, score_accuracy=score_accuracy,
+                top_n=args.telegram_top_n,
             )
             send_telegram_message(telegram_token, telegram_chat_id, message)
             if args.telegram_send_chart:
