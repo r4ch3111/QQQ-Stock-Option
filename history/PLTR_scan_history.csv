@@ -1,0 +1,2 @@
+date,ticker,spot,atm_iv,technical_score,ema9_signal,vwap_signal,sma50_signal,macd_signal,macd_momentum_signal,rsi_signal,rel_volume_signal,bb_signal
+2026-07-23 19:46:52.778886,PLTR,122.0,0.3754945263671875,-82.0,-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,0.0,0.0
