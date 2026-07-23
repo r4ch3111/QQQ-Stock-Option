@@ -12,6 +12,7 @@ Educational research tool that:
 6. Ranks option contracts by a user-defined balance of probability, liquidity,
    payoff potential, theta risk and technical alignment.
 7. Exports CSV files and PNG charts.
+8. Optionally sends a summary of the top contracts to a Telegram chat.
 
 This script does NOT predict market direction or guarantee profitable trades.
 Black-Scholes values and probabilities are model estimates, not execution prices
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,6 +33,7 @@ from typing import Literal
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from scipy.stats import norm
 
@@ -571,6 +574,68 @@ def build_option_table(
 
 
 # ---------------------------------------------------------------------------
+# Telegram notifications
+# ---------------------------------------------------------------------------
+
+def send_telegram_message(token: str, chat_id: str, text: str) -> None:
+    """Send a text message via a Telegram bot.
+
+    Logs a warning on failure instead of crashing the run, since a failed
+    notification shouldn't take down the whole scan.
+    """
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        response = requests.post(
+            url,
+            data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        print(f"WARNING: Telegram message failed to send: {exc}", file=sys.stderr)
+
+
+def send_telegram_photo(token: str, chat_id: str, photo_path: Path, caption: str = "") -> None:
+    """Send a photo (e.g. a chart) via a Telegram bot."""
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    try:
+        with open(photo_path, "rb") as photo_file:
+            response = requests.post(
+                url,
+                data={"chat_id": chat_id, "caption": caption},
+                files={"photo": photo_file},
+                timeout=30,
+            )
+        response.raise_for_status()
+    except (requests.RequestException, OSError) as exc:
+        print(f"WARNING: Telegram photo failed to send: {exc}", file=sys.stderr)
+
+
+def format_top_contracts_for_telegram(
+    options: pd.DataFrame,
+    technical: dict[str, float | str],
+    spot: float,
+    ticker: str,
+    top_n: int = 5,
+) -> str:
+    lines = [
+        f"*{ticker} Options Scan*",
+        f"Spot: ${spot:,.2f} | Technical: {technical['score']:.0f}/100 ({technical['direction']})",
+        "",
+    ]
+    for row in options.head(top_n).itertuples():
+        liquidity_flag = "✅" if row.passes_liquidity_filter else "⚠️"
+        lines.append(
+            f"{liquidity_flag} {row.option_type.upper()} {row.strike:g}  exp {row.expiration}\n"
+            f"   Mid ${row.mid:.2f}  |  Score {row.decision_score:.0f}/100\n"
+            f"   P(ITM) {row.probability_ITM:.0%}  |  DTE {row.DTE:.1f}  |  Θ/day {row.theta_pct_of_premium:.1%} of premium"
+        )
+    lines.append("")
+    lines.append("_Heuristic score, not a trade signal. Not financial advice._")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Reports and plots
 # ---------------------------------------------------------------------------
 
@@ -677,6 +742,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-volume", type=int, default=20)
     parser.add_argument("--max-spread-pct", type=float, default=0.20)
     parser.add_argument("--output-dir", default="qqq_model_output")
+    parser.add_argument(
+        "--no-telegram",
+        action="store_true",
+        help="Skip sending results to Telegram even if credentials are set.",
+    )
+    parser.add_argument(
+        "--telegram-top-n",
+        type=int,
+        default=5,
+        help="Number of top contracts to include in the Telegram message.",
+    )
+    parser.add_argument(
+        "--telegram-send-chart",
+        action="store_true",
+        help="Also send the option score chart as a photo to Telegram.",
+    )
     return parser.parse_args()
 
 
@@ -695,6 +776,13 @@ def main() -> int:
     )
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Telegram credentials come from environment variables (e.g. GitHub Actions
+    # secrets), never from command-line args or hardcoded values, to avoid
+    # leaking them into shell history or version control.
+    telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    telegram_enabled = bool(telegram_token and telegram_chat_id) and not args.no_telegram
+
     try:
         daily, intraday = download_price_data(config)
         technical = technical_score(intraday.iloc[-1], intraday.iloc[-2])
@@ -709,17 +797,36 @@ def main() -> int:
         intraday.to_csv(config.output_dir / f"{config.ticker}_intraday_{timestamp}.csv")
         options.to_csv(config.output_dir / f"{config.ticker}_option_rankings_{timestamp}.csv", index=False)
 
+        intraday_chart_path = config.output_dir / f"{config.ticker}_intraday_chart_{timestamp}.png"
+        score_chart_path = config.output_dir / f"{config.ticker}_option_scores_{timestamp}.png"
+
         save_price_chart(
             intraday,
-            config.output_dir / f"{config.ticker}_intraday_chart_{timestamp}.png",
+            intraday_chart_path,
             f"{config.ticker} intraday price and indicators",
         )
-        save_score_chart(
-            options,
-            config.output_dir / f"{config.ticker}_option_scores_{timestamp}.png",
-        )
+        save_score_chart(options, score_chart_path)
         print_summary(config, daily, intraday, technical, expiration, options)
         print(f"\nFiles saved in: {config.output_dir.resolve()}")
+
+        if telegram_enabled:
+            message = format_top_contracts_for_telegram(
+                options, technical, spot, config.ticker, top_n=args.telegram_top_n
+            )
+            send_telegram_message(telegram_token, telegram_chat_id, message)
+            if args.telegram_send_chart:
+                send_telegram_photo(
+                    telegram_token, telegram_chat_id, score_chart_path,
+                    caption=f"{config.ticker} top contract scores",
+                )
+            print("Telegram notification sent.")
+        elif not args.no_telegram:
+            print(
+                "Telegram not configured (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID "
+                "env vars to enable). Skipping notification.",
+                file=sys.stderr,
+            )
+
         return 0
 
     except Exception as exc:
@@ -729,6 +836,11 @@ def main() -> int:
             "Yahoo Finance is returning an option chain.",
             file=sys.stderr,
         )
+        if telegram_enabled:
+            send_telegram_message(
+                telegram_token, telegram_chat_id,
+                f"*{config.ticker} scan failed*\n`{exc}`",
+            )
         return 1
 
 
