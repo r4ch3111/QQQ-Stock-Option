@@ -1,0 +1,2 @@
+date,ticker,spot,atm_iv,technical_score,ema9_signal,vwap_signal,sma50_signal,macd_signal,macd_momentum_signal,rsi_signal,rel_volume_signal,bb_signal
+2026-07-30 23:18:15.074469,MSFT,451.4800109863281,0.42142302215576166,-47.0,-1.0,1.0,-1.0,-1.0,-1.0,0.0,-1.0,-1.0
