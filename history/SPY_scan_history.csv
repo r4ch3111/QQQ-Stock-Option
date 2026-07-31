@@ -1,0 +1,2 @@
+date,ticker,spot,atm_iv,technical_score,ema9_signal,vwap_signal,sma50_signal,macd_signal,macd_momentum_signal,rsi_signal,rel_volume_signal,bb_signal
+2026-07-31 17:44:23.581144,SPY,745.9199829101562,0.08138430831909181,70.0,1.0,1.0,1.0,1.0,-1.0,1.0,0.0,0.0
